@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Конструктор Тестов (Cloud)</title>
+    <!-- Подключаем Tailwind CSS для стилизации -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Плавные переходы между "экранами" */
+        .screen {
+            display: none;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+        .screen.active {
+            display: block;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        /* Убираем стрелочки у input[type=number] */
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button {
+            -webkit-appearance: none; 
+            margin: 0;
+        }
+        input[type=number] {
+            -moz-appearance: textfield;
+        }
+        /* Стилизация для альбомной таблицы */
+        #detailed-results-container {
+            max-width: 100%; /* Занимает всю доступную ширину */
+            overflow-x: auto; /* Позволяет прокручивать таблицу горизонтально на маленьких экранах */
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans antialiased">
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection, serverTimestamp, addDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Глобальные переменные Canvas (ОБЯЗАТЕЛЬНЫ К ИСПОЛЬЗОВАНИЮ)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let appFirebase, db, auth;
+        
+        // Устанавливаем уровень логирования Firebase для отладки
+        if (firebaseConfig.apiKey) {
+            setLogLevel('debug');
+        }
+
+        // --- Основной объект приложения, запущенный через window ---
+        window.app = {
+            // --- Свойства ---
+            user: null, 
+            userId: null, 
+            isAuthReady: false, 
+            tests: [], // Тесты будут загружены из Firestore
+            history: {}, // История будет загружена из Firestore
+            editingTestId: null, // Используем Firestore Document ID
+            currentTest: null, 
+            currentQuestionIndex: 0, 
+            userAnswers: [], 
+            timerInterval: null, 
+            
+            // --- 1. Инициализация и Аутентификация Firebase ---
+            init() {
+                if (!firebaseConfig.apiKey) {
+                     console.error("Firebase configuration is missing. Cloud features will not work.");
+                     alert("Ошибка: Не удалось подключиться к облаку. Проверьте конфигурацию Firebase.");
+                     this.showScreen('screen-login'); 
+                     this.toggleLoginFields();
+                     return;
+                }
+                
+                appFirebase = initializeApp(firebaseConfig);
+                db = getFirestore(appFirebase);
+                auth = getAuth(appFirebase);
+                
+                this.showScreen('screen-login');
+                
+                // Загружаем сохраненный тип пользователя (Админ/Стажер)
+                const userJSON = localStorage.getItem('quizAppUser');
+                if (userJSON) {
+                    this.user = JSON.parse(userJSON);
+                    document.getElementById('login-type').value = this.user.type;
+                    
+                    // Предзаполнение полей стажера
+                    if (this.user.type === 'trainee' && this.user.name) {
+                        const [name, surname] = this.user.name.split(' ');
+                        document.getElementById('trainee-name').value = name || '';
+                        document.getElementById('trainee-surname').value = surname || '';
+                    }
+                }
+
+                this.toggleLoginFields();
+
+                // 2. Слушаем состояние аутентификации
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        this.userId = user.uid;
+                        
+                        // Если пользователь вошел, но не выбрал роль через форму
+                        if (!this.user) {
+                             // В этом сценарии, мы ждем, пока пользователь выберет роль (Админ/Стажер) через форму логина.
+                             console.log(`Firebase Auth Ready: UID ${this.userId}. Awaiting local login.`);
+                        } else {
+                            this.isAuthReady = true;
+                            // Если пользователь выбрал роль и успешно аутентифицирован, инициализируем приложение
+                            this.initAppView();
+                        }
+                    } else {
+                        // Если не аутентифицирован, пытаемся войти с токеном или анонимно
+                        try {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        } catch (error) {
+                            console.error("Firebase Auth Error on startup:", error);
+                        }
+                    }
+                });
+            },
+            
+            // --- 2. Логика Хранения Данных (Real-time) ---
+            loadData() {
+                if (!this.isAuthReady || !this.userId) return;
+
+                // 1. Загрузка Тестов (Публичная коллекция)
+                const testsRef = collection(db, 'artifacts', appId, 'public', 'data', 'tests');
+                onSnapshot(testsRef, (snapshot) => {
+                    this.tests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    this.renderMainScreen();
+                    console.log("Tests loaded from Firestore:", this.tests.length);
+                }, (error) => {
+                    console.error("Error loading tests:", error);
+                });
+
+                // 2. Загрузка Истории (Приватная коллекция пользователя)
+                const historyRef = collection(db, 'artifacts', appId, 'users', this.userId, 'history');
+                onSnapshot(historyRef, (snapshot) => {
+                    this.history = {}; // Сброс истории
+                    snapshot.docs.forEach(doc => {
+                        this.history[doc.id] = doc.data(); 
+                    });
+                    this.renderMainScreen();
+                    console.log("History loaded from Firestore:", Object.keys(this.history).length);
+                }, (error) => {
+                    console.error("Error loading history:", error);
+                });
+            },
+
+            // --- 3. Управление Сессией и UI ---
+            initAppView() {
+                if (!this.user || !this.userId) return;
+
+                document.getElementById('app-header').classList.remove('hidden');
+                // Отображаем Firebase UID, это обязательно для многопользовательских приложений
+                document.getElementById('user-info').innerHTML = `
+                    <div class="text-sm font-semibold">${this.user.name} (${this.user.type === 'admin' ? 'Админ' : 'Стажёр'})</div>
+                    <div class="text-xs text-gray-500">ID: ${this.userId}</div>
+                `;
+                
+                this.toggleAdminUI();
+                this.loadData(); // Начинаем загрузку данных из облака
+                this.showScreen('screen-main');
+            },
+            
+            logout() {
+                // Выход из Firebase Auth и сброс локальной сессии
+                signOut(auth).then(() => {
+                    this.user = null;
+                    this.userId = null;
+                    this.isAuthReady = false;
+                    localStorage.removeItem('quizAppUser'); 
+                    document.getElementById('app-header').classList.add('hidden');
+                    this.showScreen('screen-login');
+                    
+                    // Очистка полей и установка дефолта на Администратора
+                    document.getElementById('login-type').value = 'admin';
+                    this.toggleLoginFields();
+                }).catch((error) => {
+                    console.error("Logout Error:", error);
+                });
+            },
+
+            toggleAdminUI() {
+                const isAdmin = this.user && this.user.type === 'admin';
+                const adminPanelBtn = document.getElementById('admin-panel-btn');
+
+                if (isAdmin) {
+                    adminPanelBtn.classList.remove('hidden');
+                } else {
+                    adminPanelBtn.classList.add('hidden');
+                }
+            },
+
+            // --- 4. Логика Экрана Входа ---
+            toggleLoginFields() {
+                const type = document.getElementById('login-type').value;
+                document.getElementById('trainee-fields').classList.toggle('hidden', type === 'admin');
+                document.getElementById('admin-fields').classList.toggle('hidden', type === 'trainee');
+            },
+            
+            handleLogin() {
+                const type = document.getElementById('login-type').value;
+                let userName = null;
+                
+                if (!this.userId) {
+                    alert('Ошибка аутентификации: Пользователь не авторизован Firebase. Попробуйте обновить страницу.');
+                    return;
+                }
+                
+                // 1. Logic for Trainee
+                if (type === 'trainee') {
+                    const name = document.getElementById('trainee-name').value.trim();
+                    const surname = document.getElementById('trainee-surname').value.trim();
+                    
+                    if (!name || !surname) {
+                        alert('Пожалуйста, введите имя и фамилию.');
+                        return;
+                    }
+                    userName = `${name} ${surname}`;
+                    
+                // 2. Logic for Admin
+                } else if (type === 'admin') {
+                    const code = document.getElementById('admin-code').value;
+                    const CORRECT_CODE = "9566"; // Единственно верный код
+                    
+                    if (code === CORRECT_CODE) {
+                        userName = "Администратор";
+                    } else {
+                        alert('Неверный код администратора.');
+                        return;
+                    }
+                }
+                
+                // Сохраняем локально тип и имя, используем Firebase UID как ID
+                this.user = { 
+                    type: type, 
+                    name: userName,
+                    id: this.userId 
+                };
+
+                localStorage.setItem('quizAppUser', JSON.stringify(this.user));
+                this.isAuthReady = true;
+                this.initAppView(); // Запуск приложения
+            },
+
+            // --- 5. Навигация ---
+            showScreen(screenId) {
+                document.querySelectorAll('.screen').forEach(screen => {
+                    screen.classList.remove('active');
+                });
+                const targetScreen = document.getElementById(screenId);
+                if (targetScreen) {
+                    targetScreen.classList.add('active');
+                }
+            },
+            
+            // --- 6. Логика Главного Экрана ---
+            renderMainScreen() {
+                const listContainer = document.getElementById('test-list');
+                listContainer.innerHTML = ''; 
+                
+                const isAdmin = this.user && this.user.type === 'admin';
+                
+                if (this.tests.length === 0) {
+                    listContainer.innerHTML = `<p class="text-center text-gray-500">Пока нет доступных тестов. ${isAdmin ? 'Используйте кнопку \'+ Создать Тест\'.' : ''}</p>`;
+                    return;
+                }
+                
+                // Сортируем тесты по заголовку
+                const sortedTests = [...this.tests].sort((a, b) => a.title.localeCompare(b.title));
+
+                sortedTests.forEach((test) => {
+                    const testCard = document.createElement('div');
+                    
+                    const testId = test.id; 
+                    const isCompleted = this.history[testId] && this.history[testId].userAnswers;
+                    const completionData = this.history[testId];
+
+                    testCard.className = 'bg-white p-4 rounded-lg shadow flex justify-between items-center transition-all cursor-pointer hover:shadow-lg';
+                    
+                    let statusBadge = '';
+                    let startButton = '';
+
+                    if (isCompleted) {
+                        testCard.classList.add('opacity-80', 'bg-green-50');
+                        statusBadge = `<span class="text-xs font-bold text-green-700 bg-green-200 px-2 py-1 rounded-full ml-2">Завершён: ${completionData.score}/10</span>`;
+                        
+                        startButton = `
+                            <button disabled class="bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg text-sm cursor-not-allowed mr-2">
+                                Пройдено
+                            </button>
+                            <button onclick="event.stopPropagation(); app.viewPastResults('${testId}')" class="bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600 text-sm transition-all">
+                                Посмотреть результаты
+                            </button>
+                        `;
+                    } else {
+                        startButton = `
+                            <button onclick="event.stopPropagation(); app.startTest('${testId}')" class="bg-green-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-green-600 text-sm transition-all">
+                                Начать
+                            </button>
+                        `;
+                    }
+                    
+                    let adminButtons = '';
+                    if (isAdmin) {
+                        adminButtons = `
+                            <button onclick="event.stopPropagation(); app.showCreateScreen('${testId}')" class="bg-yellow-400 text-yellow-900 font-semibold py-2 px-3 rounded-lg hover:bg-yellow-500 text-sm transition-all">
+                                Ред.
+                            </button>
+                            <button onclick="event.stopPropagation(); app.deleteTest('${testId}')" class="bg-red-100 text-red-600 font-semibold py-2 px-3 rounded-lg hover:bg-red-200 text-sm transition-all">
+                                Удалить
+                            </button>
+                        `;
+                    }
+                    
+                    testCard.innerHTML = `
+                        <div>
+                            <h3 class="text-lg font-bold text-gray-800">${test.title} ${statusBadge}</h3>
+                            <p class="text-sm text-gray-500">${test.questions.length} вопр. | ${test.timeLimit > 0 ? test.timeLimit + ' мин.' : 'Без времени'}</p>
+                        </div>
+                        <div class="space-x-2 flex items-center">
+                            ${startButton}
+                            ${adminButtons}
+                        </div>
+                    `;
+                    listContainer.appendChild(testCard);
+                });
+            },
+            
+            async deleteTest(testId) {
+                const test = this.tests.find(t => t.id === testId);
+                if (!test) return;
+
+                if (confirm(`Вы уверены, что хотите удалить тест "${test.title}"? Это действие удалит его для всех пользователей.`)) {
+                    try {
+                        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'tests', testId);
+                        await deleteDoc(docRef);
+                        // История автоматически удаляется по правилам безопасности, если настроено каскадное удаление.
+                        alert(`Тест "${test.title}" успешно удален из облака.`);
+                    } catch (e) {
+                        console.error("Error deleting test:", e);
+                        alert('Ошибка при удалении теста. Проверьте консоль.');
+                    }
+                }
+            },
+            
+            // --- 7. Логика Создания/Редактирования Теста ---
+            
+            showCreateScreen(testId = null) {
+                this.editingTestId = testId;
+                const titleEl = document.getElementById('create-screen-title');
+                const saveBtn = document.getElementById('save-test-btn');
+                const questionsContainer = document.getElementById('questions-container');
+
+                if (testId) {
+                    const test = this.tests.find(t => t.id === testId);
+                    if (!test) return; // Should not happen with real-time sync
+                    
+                    titleEl.innerText = "Редактирование Теста";
+                    saveBtn.innerText = "Сохранить Изменения";
+                    
+                    document.getElementById('test-title').value = test.title;
+                    document.getElementById('test-time').value = test.timeLimit;
+                    
+                    questionsContainer.innerHTML = '';
+                    test.questions.forEach((q, qIndex) => {
+                        this.addQuestionField(q, qIndex); 
+                    });
+                    
+                } else {
+                    titleEl.innerText = "Новый Тест";
+                    saveBtn.innerText = "Сохранить Тест";
+
+                    document.getElementById('test-title').value = '';
+                    document.getElementById('test-time').value = '';
+                    questionsContainer.innerHTML = '';
+                    this.addQuestionField(); 
+                }
+                
+                this.showScreen('screen-create');
+            },
+
+            cancelCreateEdit() {
+                this.editingTestId = null; 
+                this.showScreen('screen-main');
+            },
+            
+            addQuestionField(questionData = null, questionIndex = null) {
+                const container = document.getElementById('questions-container');
+                const template = document.getElementById('question-template');
+                const newQuestion = template.content.cloneNode(true);
+                const questionBlock = newQuestion.querySelector('.question-block');
+                
+                const qIndex = questionIndex ?? container.childElementCount;
+                const radioGroupName = `correct_answer_group_${qIndex}`;
+                
+                const optionsGrid = questionBlock.querySelector('.options-grid');
+                
+                if (questionData) {
+                    questionBlock.querySelector('.question-text-input').value = questionData.questionText;
+                    
+                    questionData.options.forEach((opt, optIndex) => {
+                        const optionField = this.createOptionField(radioGroupName, opt);
+                        if (optIndex === questionData.correctAnswerIndex) {
+                            optionField.querySelector('.correct-option-radio').checked = true;
+                        }
+                        optionsGrid.appendChild(optionField);
+                    });
+
+                } else {
+                    // Добавляем минимум 2 варианта для нового вопроса
+                    optionsGrid.appendChild(this.createOptionField(radioGroupName));
+                    optionsGrid.appendChild(this.createOptionField(radioGroupName));
+                }
+                
+                container.appendChild(questionBlock);
+            },
+            
+            addOptionField(button) {
+                const optionsGrid = button.closest('.question-block').querySelector('.options-grid');
+                const radioGroupName = optionsGrid.querySelector('.correct-option-radio').name;
+                optionsGrid.appendChild(this.createOptionField(radioGroupName));
+            },
+
+            createOptionField(radioGroupName, optionText = '') {
+                const template = document.getElementById('option-template');
+                const newOption = template.content.cloneNode(true);
+                newOption.querySelector('.correct-option-radio').name = radioGroupName;
+                newOption.querySelector('.option-text-input').value = optionText;
+                return newOption;
+            },
+            
+            async saveTest() {
+                const title = document.getElementById('test-title').value.trim();
+                let timeLimit = parseInt(document.getElementById('test-time').value) || 0;
+                
+                if (!title) {
+                    alert('Пожалуйста, введите название теста.');
+                    return;
+                }
+                
+                const questions = [];
+                const questionBlocks = document.querySelectorAll('#questions-container .question-block');
+                
+                if (questionBlocks.length === 0) {
+                    alert('Пожалуйста, добавьте хотя бы один вопрос.');
+                    return;
+                }
+                
+                let allQuestionsValid = true;
+                
+                questionBlocks.forEach(block => {
+                    const questionText = block.querySelector('.question-text-input').value.trim();
+                    if (!questionText) { allQuestionsValid = false; return; }
+                    
+                    const options = [];
+                    let correctAnswerIndex = -1;
+                    
+                    const optionInputs = block.querySelectorAll('.option-text-input');
+                    const radioInputs = block.querySelectorAll('.correct-option-radio');
+                    
+                    optionInputs.forEach((optInput, index) => {
+                        const optionText = optInput.value.trim();
+                        if (optionText) {
+                            options.push(optionText);
+                            if (radioInputs[index].checked) {
+                                correctAnswerIndex = options.length - 1; // Correct index in the filtered 'options' array
+                            }
+                        }
+                    });
+                    
+                    if (options.length < 2 || correctAnswerIndex === -1) {
+                         allQuestionsValid = false; 
+                         return;
+                    }
+                    
+                    questions.push({
+                        questionText: questionText,
+                        options: options,
+                        correctAnswerIndex: correctAnswerIndex
+                    });
+                });
+                
+                if (!allQuestionsValid) {
+                    alert('Ошибка: Убедитесь, что каждый вопрос имеет текст, как минимум 2 варианта ответа, и один из них отмечен как правильный.');
+                    return;
+                }
+                
+                const testData = {
+                    title: title,
+                    timeLimit: timeLimit,
+                    questions: questions,
+                    updatedAt: serverTimestamp() 
+                };
+                
+                const testsCollectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'tests');
+
+                try {
+                    if (this.editingTestId) {
+                        // Обновление существующего теста
+                        const docRef = doc(testsCollectionRef, this.editingTestId);
+                        await setDoc(docRef, testData, { merge: true });
+                        alert('Тест успешно обновлен в облаке!');
+                    } else {
+                        // Создание нового теста
+                        await addDoc(testsCollectionRef, testData);
+                        alert('Новый тест успешно создан в облаке!');
+                    }
+                } catch (e) {
+                    console.error("Error saving test to Firestore:", e);
+                    alert('Ошибка при сохранении теста. Проверьте консоль.');
+                    return;
+                }
+
+                this.editingTestId = null; 
+                this.showScreen('screen-main');
+            },
+
+            // --- 8. Логика Прохождения Теста ---
+            startTest(testId) {
+                const test = this.tests.find(t => t.id === testId);
+                if (!test) return;
+
+                // Проверка: можно ли начать тест?
+                if (this.history[testId]) {
+                    alert('Этот тест уже был завершен. Тест можно пройти только один раз.');
+                    this.showScreen('screen-main');
+                    return;
+                }
+                
+                this.currentTest = test;
+                this.currentQuestionIndex = 0;
+                this.userAnswers = [];
+                
+                document.getElementById('start-test-title').innerText = this.currentTest.title;
+                const info = `${this.currentTest.questions.length} вопр. | ${this.currentTest.timeLimit > 0 ? this.currentTest.timeLimit + ' мин.' : 'Без ограничения времени'}`;
+                document.getElementById('start-test-info').innerText = info;
+                
+                this.showScreen('screen-start-test');
+            },
+
+            beginTestLogic() {
+                this.showScreen('screen-test');
+                document.getElementById('test-active-title').innerText = this.currentTest.title;
+                
+                if (this.currentTest.timeLimit > 0) {
+                    this.startTimer(this.currentTest.timeLimit * 60);
+                } else {
+                    document.getElementById('test-timer').innerText = "Без времени";
+                }
+                
+                this.displayQuestion();
+            },
+            
+            startTimer(durationInSeconds) {
+                if (this.timerInterval) clearInterval(this.timerInterval); 
+                let timer = durationInSeconds;
+                const timerEl = document.getElementById('test-timer');
+                
+                const updateDisplay = () => {
+                    const minutes = Math.floor(timer / 60);
+                    const seconds = timer % 60;
+                    timerEl.innerText = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+                }
+                
+                updateDisplay(); 
+                
+                this.timerInterval = setInterval(() => {
+                    timer--;
+                    updateDisplay();
+                    
+                    if (timer <= 0) {
+                        this.finishTest(true); 
+                    }
+                }, 1000);
+            },
+            
+            displayQuestion() {
+                const question = this.currentTest.questions[this.currentQuestionIndex];
+                
+                const progress = ((this.currentQuestionIndex) / this.currentTest.questions.length) * 100;
+                document.getElementById('test-progress-bar').style.width = `${progress}%`;
+                
+                document.getElementById('test-question-text').innerText = `${this.currentQuestionIndex + 1}. ${question.questionText}`;
+                
+                const optionsContainer = document.getElementById('test-options-container');
+                optionsContainer.innerHTML = '';
+                
+                question.options.forEach((option, index) => {
+                    optionsContainer.innerHTML += `
+                        <label class="block w-full p-4 border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer">
+                            <input type="radio" name="answer" value="${index}" class="mr-3 text-blue-600 focus:ring-blue-500">
+                            <span class="text-gray-700">${option}</span>
+                        </label>
+                    `;
+                });
+                
+                const nextBtn = document.getElementById('test-next-btn');
+                if (this.currentQuestionIndex === this.currentTest.questions.length - 1) {
+                    nextBtn.innerText = 'Завершить тест';
+                    nextBtn.classList.remove('bg-blue-600');
+                    nextBtn.classList.add('bg-green-600');
+                } else {
+                    nextBtn.innerText = 'Следующий вопрос';
+                    nextBtn.classList.remove('bg-green-600');
+                    nextBtn.classList.add('bg-blue-600');
+                }
+            },
+            
+            nextQuestion() {
+                const selectedOption = document.querySelector('input[name="answer"]:checked');
+                this.userAnswers[this.currentQuestionIndex] = selectedOption ? parseInt(selectedOption.value) : -1;
+                
+                if (this.currentQuestionIndex < this.currentTest.questions.length - 1) {
+                    this.currentQuestionIndex++;
+                    this.displayQuestion();
+                } else {
+                    this.finishTest(false); 
+                }
+            },
+
+            // --- 9. Логика Результатов (Сохранение в облако) ---
+            async finishTest(timeIsUp) {
+                if (this.timerInterval) {
+                    clearInterval(this.timerInterval);
+                    this.timerInterval = null;
+                }
+                
+                if (timeIsUp) {
+                    alert("Время вышло!");
+                }
+                
+                // Заполняем пропущенные ответы, если время вышло
+                for(let i=0; i < this.currentTest.questions.length; i++) {
+                    if (this.userAnswers[i] === undefined) {
+                        this.userAnswers[i] = -1;
+                    }
+                }
+                
+                document.getElementById('test-progress-bar').style.width = `100%`;
+
+                const { score, correct, total } = this.calculateScore();
+                
+                // --- Запись в историю прохождений (ВКЛЮЧАЯ userAnswers) ---
+                const testId = this.currentTest.id; // Используем Firestore ID
+                
+                const historyData = {
+                    score: score,
+                    correct: correct,
+                    total: total,
+                    date: serverTimestamp(), // Время на сервере
+                    userAnswers: JSON.stringify(this.userAnswers) // Сохраняем ответы как JSON-строку
+                };
+
+                try {
+                    const docRef = doc(db, 'artifacts', appId, 'users', this.userId, 'history', testId);
+                    await setDoc(docRef, historyData);
+                    console.log("History saved to Firestore successfully.");
+                } catch (e) {
+                    console.error("Error saving history to Firestore:", e);
+                }
+                
+                // Отображение результатов
+                document.getElementById('result-main-title').innerText = 'Тест Завершен!';
+                document.getElementById('result-score').innerText = score;
+                document.getElementById('result-details').innerText = `Правильных ответов: ${correct} из ${total}`;
+                
+                // Передаем данные для отображения
+                this.renderDetailedResults(this.currentTest, this.userAnswers);
+                
+                this.showScreen('screen-result');
+            },
+            
+            calculateScore() {
+                let correctCount = 0;
+                const totalQuestions = this.currentTest.questions.length;
+                
+                this.currentTest.questions.forEach((question, index) => {
+                    if (question.correctAnswerIndex === this.userAnswers[index]) {
+                        correctCount++;
+                    }
+                });
+                
+                const percentage = (totalQuestions === 0) ? 0 : (correctCount / totalQuestions);
+                const scoreOutOfTen = Math.round(percentage * 10);
+                
+                return {
+                    score: scoreOutOfTen,
+                    correct: correctCount,
+                    total: totalQuestions
+                };
+            },
+
+            // --- НОВОЕ: Отображение прошлых результатов ---
+            viewPastResults(testId) {
+                const test = this.tests.find(t => t.id === testId);
+                const historyData = this.history[testId];
+
+                if (!historyData || !historyData.userAnswers) {
+                    alert("Ошибка: Не удалось найти подробную историю прохождения этого теста.");
+                    return;
+                }
+                
+                // Парсим сохраненный JSON
+                let userAnswersData;
+                try {
+                    userAnswersData = JSON.parse(historyData.userAnswers);
+                } catch (e) {
+                    console.error("Failed to parse user answers JSON:", e);
+                    userAnswersData = [];
+                }
+
+                // 1. Устанавливаем заголовок
+                document.getElementById('result-main-title').innerText = `Результаты: ${test.title}`;
+
+                // 2. Отображаем общий результат
+                document.getElementById('result-score').innerText = historyData.score;
+                document.getElementById('result-details').innerText = `Правильных ответов: ${historyData.correct} из ${historyData.total}`;
+                
+                // 3. Отображаем подробную таблицу
+                this.renderDetailedResults(test, userAnswersData);
+                
+                // 4. Показываем экран
+                this.showScreen('screen-result');
+            },
+
+            // Функция для создания и рендеринга таблицы результатов
+            renderDetailedResults(testData, userAnswersData) {
+                let html = `
+                    <h3 class="text-xl font-bold text-gray-700 mb-4 text-center">Ваши ответы</h3>
+                    <div class="overflow-x-auto rounded-lg shadow-lg border border-gray-200">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-1/12">#</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-6/12">Вопрос</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-4/12">Ваш Ответ</th>
+                                    <th class="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-1/12">Верно?</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-200">
+                    `;
+
+                testData.questions.forEach((question, index) => {
+                    const userAnswerIndex = userAnswersData[index];
+                    const correctAnswerIndex = question.correctAnswerIndex;
+                    const isCorrect = userAnswerIndex === correctAnswerIndex;
+                    
+                    const userAnswerText = userAnswerIndex !== -1 && question.options[userAnswerIndex] !== undefined
+                        ? question.options[userAnswerIndex] 
+                        : '<span class="text-red-500 font-semibold">Нет ответа / Пропущено</span>';
+                    
+                    const statusIcon = isCorrect 
+                        ? '<span class="text-green-600 text-xl font-bold">&#10003;</span>' // Checkmark
+                        : '<span class="text-red-600 text-xl font-bold">&#10007;</span>'; // Cross
+
+                    html += `
+                        <tr class="${isCorrect ? 'bg-green-50/50' : 'bg-red-50/50'}">
+                            <td class="px-3 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${index + 1}</td>
+                            <td class="px-6 py-4 text-sm text-gray-900">${question.questionText}</td>
+                            <td class="px-6 py-4 text-sm text-gray-700">${userAnswerText}</td>
+                            <td class="px-3 py-4 whitespace-nowrap text-center">${statusIcon}</td>
+                        </tr>
+                    `;
+                });
+
+                html += `
+                            </tbody>
+                        </table>
+                    </div>
+                    `;
+                document.getElementById('detailed-results-container').innerHTML = html;
+            }
+        };
+
+        // Запускаем приложение
+        document.addEventListener('DOMContentLoaded', () => {
+            window.app.init();
+        });
+    </script>
+    
+    <!-- Верхняя панель (хедер) -->
+    <header id="app-header" class="bg-white shadow-md p-4 flex justify-between items-center hidden">
+        <div id="user-info" class="font-semibold text-gray-700">
+            <!-- Имя пользователя и ID будут здесь -->
+        </div>
+        <div class="flex items-center space-x-2">
+            <!-- Кнопка для Администратора -->
+            <button id="admin-panel-btn" onclick="app.showCreateScreen()" class="hidden bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow-lg hover:bg-blue-700 transition-all text-sm">
+                + Создать Тест
+            </button>
+            <button onclick="app.logout()" class="bg-gray-200 text-gray-700 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300 transition-all text-sm">
+                Выйти
+            </button>
+        </div>
+    </header>
+
+    <!-- Основной контейнер приложения -->
+    <div class="container mx-auto max-w-4xl p-4 min-h-screen">
+        
+        <!-- 0. Экран Входа (Логин) -->
+        <div id="screen-login" class="screen active space-y-4 pt-10 max-w-md mx-auto">
+            <h1 class="text-3xl font-bold text-center text-blue-700">Вход в Систему</h1>
+            <div class="bg-white p-6 rounded-lg shadow-lg">
+                <label class="block text-sm font-medium text-gray-700">Тип учётной записи</label>
+                <!-- Администратор теперь первый в списке -->
+                <select id="login-type" onchange="app.toggleLoginFields()" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2">
+                    <option value="admin">Администратор</option>
+                    <option value="trainee">Стажёр</option>
+                </select>
+
+                <!-- Поля для Стажёра -->
+                <div id="trainee-fields" class="space-y-3 mt-4 hidden">
+                    <div>
+                        <label for="trainee-name" class="block text-sm font-medium text-gray-700">Ваше Имя</label>
+                        <input type="text" id="trainee-name" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" placeholder="Иван">
+                    </div>
+                    <div>
+                        <label for="trainee-surname" class="block text-sm font-medium text-gray-700">Ваша Фамилия</label>
+                        <input type="text" id="trainee-surname" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" placeholder="Петров">
+                    </div>
+                </div>
+
+                <!-- Поле для Администратора -->
+                <div id="admin-fields" class="space-y-3 mt-4">
+                    <div>
+                        <label for="admin-code" class="block text-sm font-medium text-gray-700">Секретный Код</label>
+                        <!-- ИСПРАВЛЕНО: Изменен type на 'password' и удален секретный код из placeholder -->
+                        <input type="password" id="admin-code" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" placeholder="Введите секретный код">
+                    </div>
+                </div>
+
+                <button onclick="app.handleLogin()" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg hover:bg-blue-700 transition-all mt-6">
+                    Войти
+                </button>
+            </div>
+        </div>
+
+        <!-- 1. Главный экран (Список тестов) -->
+        <div id="screen-main" class="screen space-y-4">
+            <h1 class="text-3xl font-bold text-center text-blue-700">Доступные Тесты</h1>
+            <div id="test-list" class="space-y-3">
+                <!-- Сюда будут добавляться тесты -->
+            </div>
+        </div>
+
+        <!-- 2. Экран Создания/Редактирования Теста -->
+        <div id="screen-create" class="screen space-y-4">
+            <div class="flex justify-between items-center">
+                <h2 id="create-screen-title" class="text-2xl font-bold text-gray-800">Новый Тест</h2>
+                <button onclick="app.cancelCreateEdit()" class="text-sm text-gray-600 hover:text-red-500">Отмена</button>
+            </div>
+
+            <!-- Настройки теста -->
+            <div class="bg-white p-4 rounded-lg shadow">
+                <label for="test-title" class="block text-sm font-medium text-gray-700">Название теста</label>
+                <input type="text" id="test-title" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" placeholder="Например: 'История Древнего Рима'">
+                
+                <label for="test-time" class="block text-sm font-medium text-gray-700 mt-4">Ограничение (в минутах)</label>
+                <input type="number" id="test-time" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" placeholder="0 = без ограничения">
+            </div>
+
+            <!-- Контейнер для вопросов -->
+            <h3 class="text-xl font-semibold text-gray-700">Вопросы</h3>
+            <div id="questions-container" class="space-y-4">
+                <!-- Сюда добавляются вопросы -->
+            </div>
+
+            <!-- Кнопки управления -->
+            <button onclick="app.addQuestionField()" class="w-full bg-green-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-green-600 transition-all">
+                + Добавить вопрос
+            </button>
+            <button id="save-test-btn" onclick="app.saveTest()" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg hover:bg-blue-700 transition-all mt-4">
+                Сохранить Тест
+            </button>
+        </div>
+
+        <!-- 3. Экран "Лобби" перед началом теста -->
+        <div id="screen-start-test" class="screen text-center space-y-6 pt-10">
+            <h2 id="start-test-title" class="text-3xl font-bold text-gray-800"></h2>
+            <p id="start-test-info" class="text-lg text-gray-600"></p>
+            <div class="space-y-4">
+                <button onclick="app.beginTestLogic()" class="w-full max-w-sm mx-auto bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg hover:bg-green-700 transition-all text-xl">
+                    Начать
+                </button>
+                <button onclick="app.showScreen('screen-main')" class="w-full max-w-sm mx-auto bg-gray-200 text-gray-700 font-semibold py-2 px-4 rounded-lg hover:bg-gray-300 transition-all">
+                    Назад
+                </button>
+            </div>
+        </div>
+        
+        <!-- 4. Экран Прохождения Теста -->
+        <div id="screen-test" class="screen space-y-4">
+            <!-- Шапка теста: Название и Таймер -->
+            <div class="bg-white p-4 rounded-lg shadow-md flex justify-between items-center sticky top-0">
+                <h2 id="test-active-title" class="text-xl font-bold text-blue-700 truncate"></h2>
+                <div id="test-timer" class="text-lg font-bold text-red-600 px-3 py-1 bg-red-100 rounded-md">
+                    --:--
+                </div>
+            </div>
+            
+            <!-- Индикатор прогресса -->
+            <div class="w-full bg-gray-200 rounded-full h-2.5">
+                <div id="test-progress-bar" class="bg-blue-600 h-2.5 rounded-full" style="width: 0%"></div>
+            </div>
+
+            <!-- Карточка с вопросом -->
+            <div class="bg-white p-5 rounded-lg shadow-lg">
+                <h3 id="test-question-text" class="text-2xl font-semibold text-gray-800 mb-5"></h3>
+                <div id="test-options-container" class="space-y-3">
+                    <!-- Сюда добавляются варианты ответов (radio) -->
+                </div>
+            </div>
+
+            <!-- Кнопка "Следующий" -->
+            <button id="test-next-btn" onclick="app.nextQuestion()" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg hover:bg-blue-700 transition-all">
+                Следующий вопрос
+            </button>
+        </div>
+        
+        <!-- 5. Экран Результатов -->
+        <div id="screen-result" class="screen text-center space-y-6 pt-8">
+            <h2 id="result-main-title" class="text-3xl font-bold text-gray-800">Тест Завершен!</h2>
+            <div class="bg-white p-10 rounded-xl shadow-2xl inline-block">
+                <p class="text-lg text-gray-600">Ваша оценка:</p>
+                <div id="result-score" class="text-7xl font-bold text-blue-700 my-2">
+                    10
+                </div>
+                <p id="result-details" class="text-gray-500"></p>
+            </div>
+            <!-- Контейнер для подробной таблицы результатов -->
+            <div id="detailed-results-container" class="w-full mt-8 p-4">
+                <!-- Таблица будет вставлена сюда -->
+            </div>
+            <button onclick="app.showScreen('screen-main')" class="mt-6 w-full max-w-sm mx-auto bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg hover:bg-blue-700 transition-all text-xl">
+                На главный экран
+            </button>
+        </div>
+    </div>
+
+    <!-- Шаблон для одного вопроса в конструкторе (скрыт) -->
+    <template id="question-template">
+        <div class="question-block bg-white p-4 rounded-lg shadow-sm border border-gray-200">
+            <div class="flex justify-between items-center mb-2">
+                <label class="block text-sm font-medium text-gray-700">Текст вопроса</label>
+                <button onclick="this.closest('.question-block').remove()" class="text-sm text-red-500 hover:text-red-700 font-semibold">Удалить</button>
+            </div>
+            <input type="text" class="question-text-input mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" placeholder="О чем этот вопрос?">
+            
+            <label class="block text-sm font-medium text-gray-700 mt-4">Варианты ответов (отметьте правильный)</label>
+            <div class="options-grid grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+                <!-- Сюда добавляются поля для вариантов -->
+            </div>
+            <button onclick="app.addOptionField(this)" class="mt-2 text-sm text-blue-600 hover:text-blue-800 font-semibold">
+                + Добавить вариант
+            </button>
+        </div>
+    </template>
+
+    <!-- Шаблон для одного варианта ответа в конструкторе (скрыт) -->
+    <template id="option-template">
+        <div class="flex items-center space-x-2">
+            <input type="radio" name="correct_answer_group_X" class="correct-option-radio h-4 w-4 text-blue-600 border-gray-300 focus:ring-blue-500">
+            <input type="text" class="option-text-input block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2" placeholder="Вариант ответа">
+            <button onclick="this.parentElement.remove()" class="text-red-500 hover:text-red-700 text-xl font-bold">&times;</button>
+        </div>
+    </template>
+
+</body>
+</html>
